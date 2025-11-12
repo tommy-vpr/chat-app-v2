@@ -1,72 +1,76 @@
 import { isSpoofedBot } from "@arcjet/inspect";
 
+/**
+ * Creates a rate-limiting and protection middleware for Express
+ * following Arcjet best practices.
+ *
+ * @param {ReturnType<typeof arcjet>} arcjetInstance
+ */
 export const createRateLimitMiddleware = (arcjetInstance) => {
   return async (req, res, next) => {
     try {
-      // Get the real client IP (trust proxy or forwarded header)
+      // ✅ Get the real client IP (handle proxies & Cloudflare)
       const clientIp =
         req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.ip;
 
-      // Use user ID if authenticated, otherwise fallback to IP
+      // Use authenticated user ID if available, otherwise fallback to IP
       const identifier = req.user?.id || clientIp;
 
-      // ✅ Explicitly tell Arcjet the correct IP
+      // ✅ Explicitly tell Arcjet which IP to evaluate
       const decision = await arcjetInstance.protect(req, {
-        ip: clientIp, // <-- The missing piece
+        ip: clientIp,
         userId: identifier,
         requested: 1,
       });
 
       console.log(
-        "Arcjet decision:",
-        decision.conclusion,
-        "| IP:",
-        clientIp,
-        "| isHosting:",
-        decision.ip?.isHosting()
+        `🛡️ Arcjet decision: ${
+          decision.conclusion
+        } | IP: ${clientIp} | Hosting: ${decision.ip?.isHosting()}`
       );
 
-      // Check if request is denied
+      // --- 🧩 DENIAL HANDLING ---
+
+      // 1️⃣ Rate limit exceeded
+      if (decision.isDenied() && decision.reason.isRateLimit()) {
+        return res.status(429).json({
+          error: "Too many requests. Please try again later.",
+        });
+      }
+
+      // 2️⃣ Bot detected
+      if (decision.isDenied() && decision.reason.isBot()) {
+        return res.status(403).json({
+          error: "No bots allowed",
+        });
+      }
+
+      // 3️⃣ Generic denial (shield, injection, etc.)
       if (decision.isDenied()) {
-        if (decision.reason.isRateLimit()) {
-          return res.status(429).json({
-            error: "Too many requests. Please try again later.",
-          });
-        }
-
-        if (decision.reason.isBot()) {
-          return res.status(403).json({
-            error: "No bots allowed",
-          });
-        }
-
-        // Generic denial (Shield blocked it)
         return res.status(403).json({
           error: "Forbidden",
         });
       }
 
-      // ✅ Check for hosting IPs (VPNs, proxies, cloud providers)
-      // Only block in production, never in dev/testing
-      if (process.env.ARCJET_ENV === "production" && decision.ip.isHosting()) {
-        console.log("❌ Denied due to hosting IP:", clientIp);
-        return res.status(403).json({
-          error: "Requests from hosting providers are not allowed",
-        });
+      // --- 🧩 OPTIONAL FLAGS ---
+
+      // ⚠️ Log hosting networks but don’t block (API endpoints often come from them)
+      if (decision.ip.isHosting()) {
+        console.warn(`⚠️ Hosting IP detected (allowed): ${clientIp}`);
+        // You could add analytics or temporary throttling here if desired
       }
 
-      // Check for spoofed bots (paid Arcjet feature)
+      // ❌ Bot verification failed (premium Arcjet feature)
       if (decision.results.some(isSpoofedBot)) {
-        return res.status(403).json({
-          error: "Bot verification failed",
-        });
+        console.warn(`⚠️ Spoofed bot detected (blocked): ${clientIp}`);
+        return res.status(403).json({ error: "Bot verification failed" });
       }
 
-      // ✅ Request is allowed
+      // ✅ If we reach here, the request is allowed
       next();
     } catch (error) {
       console.error("❌ Arcjet error:", error.message);
-      // Fail open - allow request if Arcjet has an error
+      // ✅ Fail open (don’t block legit users if Arcjet fails)
       next();
     }
   };
