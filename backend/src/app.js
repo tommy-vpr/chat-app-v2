@@ -19,6 +19,16 @@ const PORT = ENV.PORT || 3000;
 app.use(express.json());
 app.use(cookieParser());
 
+app.use((req, res, next) => {
+  console.log(
+    "🕵️ Client IP:",
+    req.ip,
+    "Forwarded for:",
+    req.headers["x-forwarded-for"]
+  );
+  next();
+});
+
 // API Routes
 app.use("/api/auth", authRoutes);
 app.use("/api/messages", messageRoutes);
