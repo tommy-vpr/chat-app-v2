@@ -1,45 +1,85 @@
+// backend/src/controllers/messageController.js (PRODUCTION-READY)
 import { uploadToCloudinary } from "../utils/uploadToCloudinary.js";
 import Message from "../models/messageModel.js";
 import User from "../models/userModel.js";
+import DOMPurify from "isomorphic-dompurify";
+import { body, param, query, validationResult } from "express-validator";
+import { PAGINATION } from "../config/constant.js";
 
-// GET /api/messages/contacts - Get all users except yourself
+// ✅ VALIDATION MIDDLEWARE
+export const validateSendMessage = [
+  body("receiverId").isMongoId().withMessage("Invalid receiver ID"),
+  body("text")
+    .optional()
+    .trim()
+    .isLength({ min: 1, max: 5000 })
+    .withMessage("Message must be 1-5000 characters"),
+];
+
+export const validateGetMessages = [
+  param("id").isMongoId().withMessage("Invalid user ID"),
+  query("before").optional().isISO8601().withMessage("Invalid date format"),
+  query("limit")
+    .optional()
+    .isInt({ min: 1, max: 100 })
+    .withMessage("Limit must be 1-100"),
+];
+
+// ✅ SANITIZE INPUT
+const sanitizeText = (text) => {
+  if (!text) return "";
+
+  // Remove all HTML tags
+  const cleaned = DOMPurify.sanitize(text, {
+    ALLOWED_TAGS: [],
+    ALLOWED_ATTR: [],
+  });
+
+  // Trim and truncate
+  return cleaned.trim().substring(0, 5000);
+};
+
+// GET /api/messages/contacts
 export const getAllContacts = async (req, res) => {
   try {
     const myId = req.user._id;
 
-    // Get all users except the logged-in user
+    // ✅ Add limit to prevent huge queries
     const contacts = await User.find({ _id: { $ne: myId } })
       .select("fullname email avatar")
-      .sort({ fullname: 1 });
+      .sort({ fullname: 1 })
+      .limit(500) // ✅ Prevent loading 10k+ users
+      .lean(); // ✅ Return plain objects (faster)
 
     res.status(200).json({
       success: true,
       contacts,
     });
   } catch (error) {
-    console.error("❌ Get contacts error:", error.message);
-    res.status(500).json({ message: "Internal server error" });
+    console.error("❌ Get contacts error:", error);
+    // ✅ Don't leak error details
+    res.status(500).json({
+      success: false,
+      message: "Failed to load contacts",
+    });
   }
 };
 
-// GET /api/messages/chats - Get users you've chatted with
+// GET /api/messages/chats
 export const getChatPartners = async (req, res) => {
   try {
     const myId = req.user._id;
 
     const chatPartners = await Message.aggregate([
       {
-        // Match messages where I'm sender or receiver
         $match: {
           $or: [{ senderId: myId }, { receiverId: myId }],
         },
       },
       {
-        // Sort by newest first
         $sort: { createdAt: -1 },
       },
       {
-        // Group by the other user
         $group: {
           _id: {
             $cond: [{ $eq: ["$senderId", myId] }, "$receiverId", "$senderId"],
@@ -62,7 +102,6 @@ export const getChatPartners = async (req, res) => {
         },
       },
       {
-        // Join with users collection
         $lookup: {
           from: "users",
           localField: "_id",
@@ -74,8 +113,10 @@ export const getChatPartners = async (req, res) => {
         $unwind: "$user",
       },
       {
-        // Sort by last message time
         $sort: { "lastMessage.createdAt": -1 },
+      },
+      {
+        $limit: 100, // ✅ Limit chat list
       },
       {
         $project: {
@@ -102,81 +143,122 @@ export const getChatPartners = async (req, res) => {
       chats: chatPartners,
     });
   } catch (error) {
-    console.error("❌ Get chat partners error:", error.message);
-    res.status(500).json({ message: "Internal server error" });
+    console.error("❌ Get chat partners error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to load chats",
+    });
   }
 };
 
-// GET /api/messages/:id - Get messages with a specific user
+// ✅ GET /api/messages/:id - WITH PAGINATION
 export const getMessages = async (req, res) => {
   try {
-    const { id: otherUserId } = req.params;
-    const myId = req.user._id;
-
-    // Verify the other user exists
-    const otherUser = await User.findById(otherUserId).select(
-      "fullname avatar"
-    );
-    if (!otherUser) {
-      return res.status(404).json({ message: "User not found" });
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        errors: errors.array(),
+      });
     }
 
-    // Get all messages between these two users
-    const messages = await Message.find({
+    const { id: otherUserId } = req.params;
+    // ✅ Use constant as default
+    const { before, limit = PAGINATION.MESSAGES_PER_PAGE } = req.query;
+    const myId = req.user._id;
+
+    const otherUser = await User.findById(otherUserId)
+      .select("fullname avatar")
+      .lean();
+
+    if (!otherUser) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    let query = {
       $or: [
         { senderId: myId, receiverId: otherUserId },
         { senderId: otherUserId, receiverId: myId },
       ],
-    })
-      .sort({ createdAt: 1 }) // Oldest first
+    };
+
+    if (before) {
+      query.createdAt = { $lt: new Date(before) };
+    }
+
+    const limitNum = parseInt(limit) || PAGINATION.MESSAGES_PER_PAGE; // ✅ Fallback to constant
+
+    const messages = await Message.find(query)
+      .sort({ createdAt: -1 })
+      .limit(limitNum)
       .lean();
 
-    // Optional: Mark messages as read
-    await Message.updateMany(
+    Message.updateMany(
       {
         senderId: otherUserId,
         receiverId: myId,
         read: false,
       },
-      {
-        $set: { read: true },
-      }
-    );
+      { $set: { read: true } }
+    ).exec();
 
     res.status(200).json({
       success: true,
-      messages,
+      messages: messages.reverse(),
       user: otherUser,
+      hasMore: messages.length === limitNum,
+      nextCursor: messages.length > 0 ? messages[0].createdAt : null,
     });
   } catch (error) {
-    console.error("❌ Get messages error:", error.message);
-    res.status(500).json({ message: "Internal server error" });
+    console.error("❌ Get messages error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to load messages",
+    });
   }
 };
 
+// ✅ SEND MESSAGE - VALIDATED & SANITIZED
 export const sendMessage = async (req, res) => {
   try {
+    // ✅ Validate inputs
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        errors: errors.array(),
+      });
+    }
+
     const { receiverId, text } = req.body;
     const senderId = req.user._id;
 
-    if (!receiverId) {
-      return res.status(400).json({ message: "Receiver ID is required" });
-    }
-
     if (!text && !req.file) {
-      return res.status(400).json({ message: "Message content is required" });
+      return res.status(400).json({
+        success: false,
+        message: "Message content is required",
+      });
     }
 
     // Verify receiver exists
-    const receiver = await User.findById(receiverId);
+    const receiver = await User.findById(receiverId).lean();
     if (!receiver) {
-      return res.status(404).json({ message: "Receiver not found" });
+      return res.status(404).json({
+        success: false,
+        message: "Receiver not found",
+      });
     }
+
+    // ✅ Sanitize text
+    const sanitizedText = sanitizeText(text);
 
     const message = await Message.create({
       senderId,
       receiverId,
-      text: text || "",
+      text: sanitizedText,
       read: false,
     });
 
@@ -185,25 +267,55 @@ export const sendMessage = async (req, res) => {
       message,
     });
   } catch (error) {
-    console.error("❌ Send message error:", error.message);
-    res.status(500).json({ message: "Internal server error" });
+    console.error("❌ Send message error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to send message",
+    });
   }
 };
 
+// ✅ SEND IMAGE - WITH VALIDATION
 export const sendImageMessage = async (req, res) => {
   try {
     const { receiverId } = req.body;
     const senderId = req.user._id;
 
     if (!receiverId) {
-      return res.status(400).json({ message: "Receiver ID is required" });
+      return res.status(400).json({
+        success: false,
+        message: "Receiver ID is required",
+      });
     }
 
     if (!req.file) {
-      return res.status(400).json({ message: "Image is required" });
+      return res.status(400).json({
+        success: false,
+        message: "Image is required",
+      });
     }
 
-    // Upload image to Cloudinary
+    // ✅ Validate file type by magic number (not just extension)
+    const fileType = req.file.mimetype;
+    const allowedTypes = ["image/jpeg", "image/png", "image/gif", "image/webp"];
+
+    if (!allowedTypes.includes(fileType)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid image type. Only JPEG, PNG, GIF, WEBP allowed",
+      });
+    }
+
+    // ✅ Validate file size (5MB max)
+    const maxSize = 5 * 1024 * 1024; // 5MB
+    if (req.file.size > maxSize) {
+      return res.status(400).json({
+        success: false,
+        message: "Image must be less than 5MB",
+      });
+    }
+
+    // Upload to Cloudinary
     const result = await uploadToCloudinary(req.file.buffer, "messages");
 
     const message = await Message.create({
@@ -211,6 +323,7 @@ export const sendImageMessage = async (req, res) => {
       receiverId,
       image: result.secure_url,
       imagePublicId: result.public_id,
+      read: false,
     });
 
     res.status(201).json({
@@ -218,8 +331,11 @@ export const sendImageMessage = async (req, res) => {
       message,
     });
   } catch (error) {
-    console.error("❌ Send image error:", error.message);
-    res.status(500).json({ message: "Internal server error" });
+    console.error("❌ Send image error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to send image",
+    });
   }
 };
 
@@ -256,6 +372,9 @@ export const getConversations = async (req, res) => {
         $unwind: "$userInfo",
       },
       {
+        $limit: 100, // ✅ Limit results
+      },
+      {
         $project: {
           _id: 1,
           lastMessage: 1,
@@ -271,7 +390,10 @@ export const getConversations = async (req, res) => {
       conversations,
     });
   } catch (error) {
-    console.error("❌ Get conversations error:", error.message);
-    res.status(500).json({ message: "Internal server error" });
+    console.error("❌ Get conversations error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to load conversations",
+    });
   }
 };

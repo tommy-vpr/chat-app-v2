@@ -1,6 +1,4 @@
-// frontend/src/components/MessageInput.jsx (UPDATED WITH TYPING INDICATORS)
-// Replace your existing MessageInput.jsx with this
-
+// frontend/src/components/MessageInput.jsx (WITH THEME)
 import { useState, useRef, useEffect } from "react";
 import { useMessages } from "../context/MessageContext";
 
@@ -10,15 +8,26 @@ const MessageInput = ({ receiverId }) => {
   const [imagePreview, setImagePreview] = useState(null);
   const [sending, setSending] = useState(false);
   const fileInputRef = useRef(null);
+
+  // ✅ Typing indicator refs
   const typingTimeoutRef = useRef(null);
+  const isTypingRef = useRef(false);
+  const keystrokeCountRef = useRef(0);
+
   const { sendMessage, sendImageMessage, emitTyping, emitStopTyping } =
     useMessages();
+
+  // ✅ CONFIGURABLE: Minimum keystrokes before showing typing indicator
+  const TYPING_THRESHOLD = 15;
+  const TYPING_TIMEOUT = 2000;
 
   // Cleanup on unmount
   useEffect(() => {
     return () => {
       if (typingTimeoutRef.current) {
         clearTimeout(typingTimeoutRef.current);
+      }
+      if (isTypingRef.current) {
         emitStopTyping();
       }
     };
@@ -53,20 +62,38 @@ const MessageInput = ({ receiverId }) => {
   };
 
   const handleTextChange = (e) => {
-    setText(e.target.value);
+    const newText = e.target.value;
+    setText(newText);
 
-    // Emit typing indicator
-    emitTyping();
+    // ✅ Count keystrokes (non-whitespace characters)
+    const nonWhitespaceCount = newText.replace(/\s/g, "").length;
+    keystrokeCountRef.current = nonWhitespaceCount;
+
+    console.log(
+      `📊 Keystroke count: ${keystrokeCountRef.current}/${TYPING_THRESHOLD}`
+    );
+
+    // ✅ ONLY emit typing if threshold is met
+    if (keystrokeCountRef.current >= TYPING_THRESHOLD && !isTypingRef.current) {
+      emitTyping();
+      isTypingRef.current = true;
+      console.log("⌨️ Started typing (threshold met)");
+    }
 
     // Clear previous timeout
     if (typingTimeoutRef.current) {
       clearTimeout(typingTimeoutRef.current);
     }
 
-    // Stop typing after 2 seconds of inactivity
-    typingTimeoutRef.current = setTimeout(() => {
-      emitStopTyping();
-    }, 2000);
+    // ✅ Send "stop typing" after inactivity (only if typing was started)
+    if (isTypingRef.current) {
+      typingTimeoutRef.current = setTimeout(() => {
+        emitStopTyping();
+        isTypingRef.current = false;
+        keystrokeCountRef.current = 0;
+        console.log("⏸️ Stopped typing (timeout)");
+      }, TYPING_TIMEOUT);
+    }
   };
 
   const handleSend = async (e) => {
@@ -76,21 +103,26 @@ const MessageInput = ({ receiverId }) => {
 
     setSending(true);
 
-    // Stop typing indicator
-    emitStopTyping();
+    // ✅ Stop typing indicator immediately when sending
     if (typingTimeoutRef.current) {
       clearTimeout(typingTimeoutRef.current);
     }
+    if (isTypingRef.current) {
+      emitStopTyping();
+      isTypingRef.current = false;
+      console.log("⏸️ Stopped typing (sent message)");
+    }
+
+    // ✅ Reset keystroke counter
+    keystrokeCountRef.current = 0;
 
     try {
       if (selectedImage) {
-        // Send image message
         await sendImageMessage(receiverId, selectedImage);
         handleRemoveImage();
       }
 
       if (text.trim()) {
-        // Send text message
         await sendMessage(receiverId, text.trim());
       }
 
@@ -104,10 +136,10 @@ const MessageInput = ({ receiverId }) => {
   };
 
   return (
-    <div className="border-t border-gray-200 bg-white">
+    <div className="border-t border-theme bg-theme">
       {/* Image Preview */}
       {imagePreview && (
-        <div className="p-4 border-b border-gray-200">
+        <div className="p-4 border-b border-theme">
           <div className="relative inline-block">
             <img
               src={imagePreview}
@@ -116,7 +148,7 @@ const MessageInput = ({ receiverId }) => {
             />
             <button
               onClick={handleRemoveImage}
-              className="absolute -top-2 -right-2 bg-red-500 text-white rounded-full w-6 h-6 flex items-center justify-center hover:bg-red-600"
+              className="absolute -top-2 -right-2 bg-[var(--color-error)] text-white rounded-full w-6 h-6 flex items-center justify-center hover:opacity-90 transition-opacity"
             >
               ×
             </button>
@@ -137,7 +169,7 @@ const MessageInput = ({ receiverId }) => {
         <button
           type="button"
           onClick={() => fileInputRef.current?.click()}
-          className="flex-shrink-0 p-2 text-gray-600 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
+          className="flex-shrink-0 p-2 text-theme-secondary hover:text-primary hover:bg-[var(--color-primaryLight)] rounded-lg transition-colors"
           disabled={sending}
         >
           <svg
@@ -168,17 +200,24 @@ const MessageInput = ({ receiverId }) => {
             }}
             placeholder="Type a message..."
             rows={1}
-            className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent resize-none"
+            className="w-full px-4 py-2 bg-theme text-theme border border-theme rounded-lg focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)] focus:border-transparent resize-none placeholder:text-theme-tertiary"
             disabled={sending}
             style={{ maxHeight: "120px" }}
           />
+
+          {/* ✅ Visual feedback showing threshold progress */}
+          {text.length > 0 && keystrokeCountRef.current < TYPING_THRESHOLD && (
+            <div className="absolute -top-6 right-2 text-xs text-theme-tertiary">
+              {keystrokeCountRef.current}/{TYPING_THRESHOLD}
+            </div>
+          )}
         </div>
 
         {/* Send Button */}
         <button
           type="submit"
           disabled={(!text.trim() && !selectedImage) || sending}
-          className="flex-shrink-0 p-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+          className="flex-shrink-0 p-2 bg-primary text-white rounded-lg hover:bg-primary-hover disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
         >
           {sending ? (
             <div className="w-6 h-6 border-2 border-white border-t-transparent rounded-full animate-spin" />

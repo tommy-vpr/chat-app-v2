@@ -4,9 +4,130 @@
 
 body {
   margin: 0;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
-    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Roboto", "Oxygen",
+    "Ubuntu", "Cantarell", "Fira Sans", "Droid Sans", "Helvetica Neue",
     sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+/* CSS Variables for theming */
+:root {
+  /* Default theme (will be overridden by ThemeContext) */
+  --color-bg: #ffffff;
+  --color-bgSecondary: #f7f7f7;
+  --color-bgTertiary: #efefef;
+  --color-text: #212121;
+  --color-textSecondary: #6b6b6b;
+  --color-textTertiary: #999999;
+  --color-primary: #ff6c37;
+  --color-primaryHover: #ff5722;
+  --color-primaryLight: #ffe8df;
+  --color-border: #e0e0e0;
+  --color-borderLight: #f0f0f0;
+  --color-success: #22c55e;
+  --color-error: #ef4444;
+  --color-warning: #f59e0b;
+  --color-info: #3b82f6;
+  --color-chatBg: #fafafa;
+  --color-messageBubble: #ffffff;
+  --color-messageBubbleOwn: #ff6c37;
+  --color-messageBubbleOwnText: #ffffff;
+  --color-sidebarBg: #ffffff;
+  --color-sidebarHover: #f5f5f5;
+  --color-sidebarActive: #ffe8df;
+  --color-headerBg: #ffffff;
+  --color-headerBorder: #e0e0e0;
+  --color-online: #22c55e;
+  --color-offline: #9ca3af;
+}
+
+body {
+  background-color: var(--color-bg);
+  color: var(--color-text);
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+/* ✅ Custom utility classes for theme colors */
+@layer utilities {
+  /* Backgrounds */
+  .bg-theme {
+    background-color: var(--color-bg);
+  }
+  .bg-theme-secondary {
+    background-color: var(--color-bgSecondary);
+  }
+  .bg-theme-tertiary {
+    background-color: var(--color-bgTertiary);
+  }
+  .bg-chat {
+    background-color: var(--color-chatBg);
+  }
+  .bg-sidebar {
+    background-color: var(--color-sidebarBg);
+  }
+  .bg-header {
+    background-color: var(--color-headerBg);
+  }
+  .bg-primary {
+    background-color: var(--color-primary);
+  }
+  .bg-message-bubble {
+    background-color: var(--color-messageBubble);
+  }
+  .bg-message-bubble-own {
+    background-color: var(--color-messageBubbleOwn);
+  }
+
+  /* Hover states */
+  .bg-primary-hover:hover {
+    background-color: var(--color-primaryHover);
+  }
+  .bg-sidebar-hover:hover {
+    background-color: var(--color-sidebarHover);
+  }
+
+  /* Active states */
+  .bg-sidebar-active {
+    background-color: var(--color-sidebarActive);
+  }
+
+  /* Text colors */
+  .text-theme {
+    color: var(--color-text);
+  }
+  .text-theme-secondary {
+    color: var(--color-textSecondary);
+  }
+  .text-theme-tertiary {
+    color: var(--color-textTertiary);
+  }
+  .text-primary {
+    color: var(--color-primary);
+  }
+  .text-message-bubble-own {
+    color: var(--color-messageBubbleOwnText);
+  }
+
+  /* Borders */
+  .border-theme {
+    border-color: var(--color-border);
+  }
+  .border-header {
+    border-color: var(--color-headerBorder);
+  }
+
+  /* Status colors */
+  .text-online {
+    color: var(--color-online);
+  }
+  .text-offline {
+    color: var(--color-offline);
+  }
+  .bg-online {
+    background-color: var(--color-online);
+  }
+  .bg-offline {
+    background-color: var(--color-offline);
+  }
 }

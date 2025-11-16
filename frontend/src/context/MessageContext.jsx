@@ -1,17 +1,16 @@
-// frontend/src/context/MessageContext.jsx
-// Production MessageContext with JWT cookie authentication
-// FIXED: Clears unread badge after reading messages
-
+// frontend/src/context/MessageContext.jsx (ADD PAGINATION)
 import {
   createContext,
   useContext,
   useState,
   useEffect,
   useCallback,
+  useRef,
 } from "react";
 import { messageAPI } from "../services/messageApi";
 import { useAuth } from "./AuthContext";
 import socketService from "../services/socket";
+import { PAGINATION } from "../config/constants"; // ✅ Import
 
 const MessageContext = createContext(null);
 
@@ -22,29 +21,30 @@ export const MessageProvider = ({ children }) => {
   const [currentChat, setCurrentChat] = useState(null);
   const [messages, setMessages] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false); // ✅ NEW
+  const [hasMore, setHasMore] = useState(true); // ✅ NEW
   const [error, setError] = useState(null);
   const [isTyping, setIsTyping] = useState(false);
   const [onlineUsers, setOnlineUsers] = useState(new Set());
 
-  // Connect to Socket.io when user logs in
+  const currentChatRef = useRef(null);
+
+  useEffect(() => {
+    currentChatRef.current = currentChat;
+  }, [currentChat]);
+
   useEffect(() => {
     if (user?.id) {
       console.log(`🔌 User logged in, connecting socket for user: ${user.id}`);
-
-      // Connect (will automatically send JWT cookie)
       socketService.connect();
-
-      // Setup Socket.io event listeners
       setupSocketListeners();
 
-      // Cleanup on unmount or user change
       return () => {
         console.log("🧹 Cleaning up socket listeners");
         socketService.removeAllListeners();
         socketService.disconnect();
       };
     } else {
-      // User logged out, disconnect socket
       console.log("👤 No user, disconnecting socket");
       socketService.disconnect();
     }
@@ -53,26 +53,22 @@ export const MessageProvider = ({ children }) => {
   const setupSocketListeners = () => {
     console.log("👂 Setting up socket listeners");
 
-    // Listen for initial online users list
     socketService.onOnlineUsers((data) => {
       console.log("👥 Initial online users:", data.users);
       setOnlineUsers(new Set(data.users));
     });
 
-    // Listen for new messages
     socketService.onNewMessage((data) => {
       const { message, from } = data;
 
       console.log("📨 New message received:", {
         from,
-        currentChatId: currentChat?._id,
-        isFromCurrentChat: currentChat?._id === from,
+        currentChatId: currentChatRef.current?._id,
+        isFromCurrentChat: currentChatRef.current?._id === from,
       });
 
-      // If message is from current chat, add to messages
-      if (currentChat?._id === from) {
+      if (currentChatRef.current?._id === from) {
         setMessages((prev) => {
-          // Avoid duplicates
           if (prev.find((m) => m._id === message._id)) {
             console.log("⚠️ Duplicate message, ignoring");
             return prev;
@@ -81,17 +77,14 @@ export const MessageProvider = ({ children }) => {
           return [...prev, message];
         });
 
-        // Mark as read immediately
         socketService.markMessagesRead(from);
       } else {
         console.log("📬 Message from other user, updating chat list");
       }
 
-      // Refresh chat list to update last message and unread count
       loadChats();
     });
 
-    // Listen for message sent confirmation
     socketService.onMessageSent((data) => {
       const { tempId, message } = data;
 
@@ -100,7 +93,6 @@ export const MessageProvider = ({ children }) => {
         messageId: message._id,
       });
 
-      // Replace temporary message with real one
       setMessages((prev) =>
         prev.map((msg) => {
           if (msg._id === tempId) {
@@ -114,52 +106,44 @@ export const MessageProvider = ({ children }) => {
       );
     });
 
-    // Listen for message errors
     socketService.onMessageError((data) => {
       const { error, tempId } = data;
       console.error("❌ Message send error:", error);
 
-      // Remove failed message
       setMessages((prev) => prev.filter((msg) => msg._id !== tempId));
       setError(error);
 
-      // Clear error after 5 seconds
       setTimeout(() => setError(null), 5000);
     });
 
-    // Listen for read receipts
     socketService.onMessagesRead((data) => {
       const { readBy, count } = data;
 
       console.log(`✓ ${count} messages read by ${readBy}`);
 
-      // Update messages to this user as read
       setMessages((prev) =>
         prev.map((msg) =>
           msg.receiverId === readBy ? { ...msg, read: true } : msg
         )
       );
 
-      // ✅ FIX: Refresh chat list to clear unread badge
       loadChats();
     });
 
-    // Listen for typing indicators
     socketService.onUserTyping((data) => {
-      if (currentChat?._id === data.userId) {
+      if (currentChatRef.current?._id === data.userId) {
         console.log("⌨️ User is typing:", data.userId);
         setIsTyping(true);
       }
     });
 
     socketService.onUserStopTyping((data) => {
-      if (currentChat?._id === data.userId) {
+      if (currentChatRef.current?._id === data.userId) {
         console.log("⏸️ User stopped typing:", data.userId);
         setIsTyping(false);
       }
     });
 
-    // Listen for online/offline status
     socketService.onUserOnline((data) => {
       console.log("🟢 User came online:", data.userId);
       setOnlineUsers((prev) => new Set([...prev, data.userId]));
@@ -175,7 +159,6 @@ export const MessageProvider = ({ children }) => {
     });
   };
 
-  // Load all contacts
   const loadContacts = useCallback(async () => {
     try {
       setLoading(true);
@@ -190,7 +173,6 @@ export const MessageProvider = ({ children }) => {
     }
   }, []);
 
-  // Load chat partners
   const loadChats = useCallback(async () => {
     try {
       const data = await messageAPI.getChatPartners();
@@ -202,7 +184,7 @@ export const MessageProvider = ({ children }) => {
     }
   }, []);
 
-  // Load messages with a specific user
+  // ✅ UPDATED: Load initial messages
   const loadMessages = useCallback(
     async (userId) => {
       try {
@@ -210,14 +192,13 @@ export const MessageProvider = ({ children }) => {
         const data = await messageAPI.getMessages(userId);
         setMessages(data.messages || []);
         setCurrentChat(data.user);
+        setHasMore(data.hasMore || false); // ✅ Set hasMore from API
         setError(null);
 
-        // Mark messages as read via socket
         if (socketService.isConnected()) {
           socketService.markMessagesRead(userId);
         }
 
-        // ✅ FIX: Refresh chat list to update unread count
         loadChats();
 
         return data;
@@ -232,18 +213,56 @@ export const MessageProvider = ({ children }) => {
     [loadChats]
   );
 
-  // Send text message via Socket.io (REAL-TIME!)
+  // ✅ NEW: Load more messages (pagination)
+  const loadMoreMessages = useCallback(async () => {
+    if (!currentChatRef.current || loadingMore || !hasMore) {
+      return;
+    }
+
+    try {
+      setLoadingMore(true);
+
+      // Get oldest message timestamp as cursor
+      const oldestMessage = messages[0];
+      if (!oldestMessage) return;
+
+      const cursor = oldestMessage.createdAt;
+
+      console.log(`📜 Loading more messages before: ${cursor}`);
+
+      const data = await messageAPI.getMessages(
+        currentChatRef.current._id,
+        cursor,
+        PAGINATION.MESSAGES_PER_PAGE
+      );
+
+      if (data.messages && data.messages.length > 0) {
+        // ✅ Prepend older messages
+        setMessages((prev) => [...data.messages, ...prev]);
+        setHasMore(data.hasMore || false);
+        console.log(`✅ Loaded ${data.messages.length} more messages`);
+      } else {
+        setHasMore(false);
+        console.log("📭 No more messages to load");
+      }
+    } catch (err) {
+      console.error("Load more messages error:", err);
+      setError(err.response?.data?.message || "Failed to load more messages");
+      setTimeout(() => setError(null), 3000);
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [messages, loadingMore, hasMore]);
+
   const sendMessage = useCallback(
     async (receiverId, text) => {
       try {
-        // Check socket connection
         if (!socketService.isConnected()) {
           throw new Error("Not connected to server. Please refresh the page.");
         }
 
         const tempId = `temp-${Date.now()}-${Math.random()}`;
 
-        // Optimistically add message to UI
         const optimisticMessage = {
           _id: tempId,
           senderId: user?.id,
@@ -255,10 +274,8 @@ export const MessageProvider = ({ children }) => {
 
         setMessages((prev) => [...prev, optimisticMessage]);
 
-        // Send via Socket.io for REAL-TIME delivery
         socketService.sendMessage(receiverId, text, null, tempId);
 
-        // Refresh chat list
         await loadChats();
 
         return optimisticMessage;
@@ -270,7 +287,6 @@ export const MessageProvider = ({ children }) => {
         setError(errorMessage);
         console.error("Send message error:", err);
 
-        // Clear error after 5 seconds
         setTimeout(() => setError(null), 5000);
 
         throw err;
@@ -279,22 +295,17 @@ export const MessageProvider = ({ children }) => {
     [user, loadChats]
   );
 
-  // Send image message
   const sendImageMessage = useCallback(
     async (receiverId, imageFile) => {
       try {
-        // Upload image via REST API
         const data = await messageAPI.sendImageMessage(receiverId, imageFile);
 
-        // Add message to local state
         setMessages((prev) => [...prev, data.message]);
 
-        // Emit via socket for real-time delivery (if connected)
         if (socketService.isConnected()) {
           socketService.sendMessage(receiverId, "", data.message.image);
         }
 
-        // Refresh chats
         await loadChats();
 
         return data.message;
@@ -307,38 +318,35 @@ export const MessageProvider = ({ children }) => {
     [loadChats]
   );
 
-  // Select a chat
   const selectChat = useCallback(
     async (user) => {
       setCurrentChat(user);
       setIsTyping(false);
+      setHasMore(true); // ✅ Reset hasMore for new chat
       await loadMessages(user._id);
     },
     [loadMessages]
   );
 
-  // Clear current chat
   const clearCurrentChat = useCallback(() => {
     setCurrentChat(null);
     setMessages([]);
     setIsTyping(false);
+    setHasMore(true); // ✅ Reset hasMore
   }, []);
 
-  // Emit typing indicator
   const emitTyping = useCallback(() => {
-    if (currentChat && socketService.isConnected()) {
-      socketService.emitTyping(currentChat._id);
+    if (currentChatRef.current && socketService.isConnected()) {
+      socketService.emitTyping(currentChatRef.current._id);
     }
-  }, [currentChat]);
+  }, []);
 
-  // Emit stop typing indicator
   const emitStopTyping = useCallback(() => {
-    if (currentChat && socketService.isConnected()) {
-      socketService.emitStopTyping(currentChat._id);
+    if (currentChatRef.current && socketService.isConnected()) {
+      socketService.emitStopTyping(currentChatRef.current._id);
     }
-  }, [currentChat]);
+  }, []);
 
-  // Check if user is online
   const isUserOnline = useCallback(
     (userId) => {
       return onlineUsers.has(userId);
@@ -352,13 +360,16 @@ export const MessageProvider = ({ children }) => {
     currentChat,
     messages,
     loading,
+    loadingMore, // ✅ NEW
+    hasMore, // ✅ NEW
     error,
     isTyping,
-    onlineUsers, // Expose online users set
+    onlineUsers,
     socketConnected: socketService.isConnected(),
     loadContacts,
     loadChats,
     loadMessages,
+    loadMoreMessages, // ✅ NEW
     sendMessage,
     sendImageMessage,
     selectChat,
