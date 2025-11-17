@@ -257,12 +257,8 @@ export const MessageProvider = ({ children }) => {
   const sendMessage = useCallback(
     async (receiverId, text) => {
       try {
-        if (!socketService.isConnected()) {
-          throw new Error("Not connected to server. Please refresh the page.");
-        }
-
+        // 1. Optimistic temp message
         const tempId = `temp-${Date.now()}-${Math.random()}`;
-
         const optimisticMessage = {
           _id: tempId,
           senderId: user?.id,
@@ -274,21 +270,28 @@ export const MessageProvider = ({ children }) => {
 
         setMessages((prev) => [...prev, optimisticMessage]);
 
-        socketService.sendMessage(receiverId, text, null, tempId);
+        // 2. CALL BACKEND REST ENDPOINT (REQUIRED)
+        const data = await messageAPI.sendMessage(receiverId, text);
+
+        // 3. Replace optimistic message with real message
+        setMessages((prev) =>
+          prev.map((msg) => (msg._id === tempId ? data.message : msg))
+        );
+
+        // 4. Emit Socket AFTER backend saved it
+        if (socketService.isConnected()) {
+          socketService.sendMessage(receiverId, text, null, data.message._id);
+        }
 
         await loadChats();
 
-        return optimisticMessage;
+        return data.message;
       } catch (err) {
-        const errorMessage =
-          err.message ||
-          err.response?.data?.message ||
-          "Failed to send message";
-        setError(errorMessage);
         console.error("Send message error:", err);
-
-        setTimeout(() => setError(null), 5000);
-
+        setMessages((prev) =>
+          prev.filter((msg) => !msg._id?.startsWith("temp-"))
+        );
+        setError("Failed to send message");
         throw err;
       }
     },
@@ -303,15 +306,20 @@ export const MessageProvider = ({ children }) => {
         setMessages((prev) => [...prev, data.message]);
 
         if (socketService.isConnected()) {
-          socketService.sendMessage(receiverId, "", data.message.image);
+          socketService.sendMessage(
+            receiverId,
+            "",
+            data.message.image,
+            data.message._id
+          );
         }
 
         await loadChats();
 
         return data.message;
       } catch (err) {
-        setError(err.response?.data?.message || "Failed to send image");
         console.error("Send image error:", err);
+        setError("Failed to send image");
         throw err;
       }
     },
