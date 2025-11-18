@@ -1,4 +1,4 @@
-// frontend/src/components/MessageInput.jsx (WITH THEME)
+// frontend/src/components/MessageInput.jsx (FIXED - NO DUPLICATE SENDS)
 import { useState, useRef, useEffect } from "react";
 import { useMessages } from "../context/MessageContext";
 
@@ -21,7 +21,7 @@ const MessageInput = ({ receiverId }) => {
   const TYPING_THRESHOLD = 15;
   const TYPING_TIMEOUT = 2000;
 
-  // Cleanup on unmount
+  // ✅ FIX 1: Cleanup on unmount
   useEffect(() => {
     return () => {
       if (typingTimeoutRef.current) {
@@ -30,8 +30,19 @@ const MessageInput = ({ receiverId }) => {
       if (isTypingRef.current) {
         emitStopTyping();
       }
+      // Clean up image preview URL to prevent memory leaks
+      if (imagePreview) {
+        URL.revokeObjectURL(imagePreview);
+      }
     };
-  }, [emitStopTyping]);
+  }, [emitStopTyping, imagePreview]);
+
+  // ✅ FIX 2: Clear form when receiver changes (prevents stale data)
+  useEffect(() => {
+    setText("");
+    handleRemoveImage();
+    keystrokeCountRef.current = 0;
+  }, [receiverId]);
 
   const handleImageSelect = (e) => {
     const file = e.target.files[0];
@@ -48,14 +59,25 @@ const MessageInput = ({ receiverId }) => {
         return;
       }
 
+      // ✅ Revoke old preview URL before creating new one
+      if (imagePreview) {
+        URL.revokeObjectURL(imagePreview);
+      }
+
       setSelectedImage(file);
       setImagePreview(URL.createObjectURL(file));
     }
   };
 
   const handleRemoveImage = () => {
+    // ✅ Revoke object URL to free memory
+    if (imagePreview) {
+      URL.revokeObjectURL(imagePreview);
+    }
+
     setSelectedImage(null);
     setImagePreview(null);
+
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
     }
@@ -69,15 +91,10 @@ const MessageInput = ({ receiverId }) => {
     const nonWhitespaceCount = newText.replace(/\s/g, "").length;
     keystrokeCountRef.current = nonWhitespaceCount;
 
-    console.log(
-      `📊 Keystroke count: ${keystrokeCountRef.current}/${TYPING_THRESHOLD}`
-    );
-
     // ✅ ONLY emit typing if threshold is met
     if (keystrokeCountRef.current >= TYPING_THRESHOLD && !isTypingRef.current) {
       emitTyping();
       isTypingRef.current = true;
-      console.log("⌨️ Started typing (threshold met)");
     }
 
     // Clear previous timeout
@@ -91,7 +108,6 @@ const MessageInput = ({ receiverId }) => {
         emitStopTyping();
         isTypingRef.current = false;
         keystrokeCountRef.current = 0;
-        console.log("⏸️ Stopped typing (timeout)");
       }, TYPING_TIMEOUT);
     }
   };
@@ -100,6 +116,9 @@ const MessageInput = ({ receiverId }) => {
     e.preventDefault();
 
     if (!text.trim() && !selectedImage) return;
+
+    // ✅ FIX 3: Prevent double submission
+    if (sending) return;
 
     setSending(true);
 
@@ -110,7 +129,6 @@ const MessageInput = ({ receiverId }) => {
     if (isTypingRef.current) {
       emitStopTyping();
       isTypingRef.current = false;
-      console.log("⏸️ Stopped typing (sent message)");
     }
 
     // ✅ Reset keystroke counter
@@ -119,6 +137,7 @@ const MessageInput = ({ receiverId }) => {
     try {
       if (selectedImage) {
         await sendImageMessage(receiverId, selectedImage);
+        // ✅ FIX 4: Clear image IMMEDIATELY after successful send
         handleRemoveImage();
       }
 
@@ -126,7 +145,13 @@ const MessageInput = ({ receiverId }) => {
         await sendMessage(receiverId, text.trim());
       }
 
+      // ✅ FIX 5: Clear text after successful send
       setText("");
+
+      // ✅ FIX 6: Use replaceState to prevent form resubmission on refresh
+      if (window.history.replaceState) {
+        window.history.replaceState(null, null, window.location.href);
+      }
     } catch (error) {
       console.error("Send message error:", error);
       alert("Failed to send message. Please try again.");
