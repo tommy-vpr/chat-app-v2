@@ -1,19 +1,18 @@
+// backend/controllers/authController.js (CORRECTED)
 import User from "../models/userModel.js";
-import bcrypt from "bcryptjs";
 import { generateToken } from "../utils/generateToken.js";
 import { sendWelcomeEmail } from "../utils/sendWelcomeEmail.js";
 import {
   uploadToCloudinary,
   deleteFromCloudinary,
 } from "../utils/uploadToCloudinary.js";
+import { logger } from "../lib/logger.js";
+import { captureException } from "../lib/sentry.js";
 
 export const signUpController = async (req, res) => {
   try {
+    // ✅ Validation already done by Zod middleware
     let { fullname, email, password } = req.body;
-
-    if (!fullname || !email || !password) {
-      return res.status(400).json({ message: "All fields are required" });
-    }
 
     // Normalize input
     fullname = fullname.trim();
@@ -22,17 +21,17 @@ export const signUpController = async (req, res) => {
     // Check if user already exists
     const existingUser = await User.findOne({ email });
     if (existingUser) {
-      return res.status(400).json({ message: "User already exists" });
+      return res.status(400).json({
+        success: false,
+        message: "User already exists",
+      });
     }
 
-    // Hash password
-    const hashedPassword = await bcrypt.hash(password, 10);
-
-    // Create user
+    // ✅ Create user (password hashing handled by model)
     const user = await User.create({
       fullname,
       email,
-      password: hashedPassword,
+      password, // Will be hashed by pre-save hook
     });
 
     // Send JWT in cookie
@@ -42,8 +41,13 @@ export const signUpController = async (req, res) => {
     try {
       await sendWelcomeEmail(user.email, user.fullname);
     } catch (error) {
-      console.log("Failed to send welcome email");
+      logger.warn("Failed to send welcome email", {
+        email: user.email,
+        error: error.message,
+      });
     }
+
+    logger.info("User registered", { userId: user._id, email: user.email });
 
     res.status(201).json({
       success: true,
@@ -52,22 +56,24 @@ export const signUpController = async (req, res) => {
         id: user._id,
         fullname: user.fullname,
         email: user.email,
+        avatar: user.avatar,
       },
     });
   } catch (error) {
-    console.error("❌ Signup error:", error.message);
-    res.status(500).json({ message: "Internal server error" });
+    logger.error("Signup error", { error: error.message });
+    captureException(error, { context: "signup" });
+
+    res.status(500).json({
+      success: false,
+      message: "Internal server error",
+    });
   }
 };
 
 export const login = async (req, res) => {
   try {
+    // ✅ Validation already done by Zod middleware
     let { email, password } = req.body;
-
-    // Validate input
-    if (!email || !password) {
-      return res.status(400).json({ message: "All fields are required" });
-    }
 
     // Normalize email
     email = email.trim().toLowerCase();
@@ -75,17 +81,25 @@ export const login = async (req, res) => {
     // Find user by email
     const user = await User.findOne({ email });
     if (!user) {
-      return res.status(401).json({ message: "Invalid email or password" });
+      return res.status(401).json({
+        success: false,
+        message: "Invalid email or password",
+      });
     }
 
-    // Compare password
-    const isPasswordValid = await bcrypt.compare(password, user.password);
+    // ✅ Use model method to compare password
+    const isPasswordValid = await user.comparePassword(password);
     if (!isPasswordValid) {
-      return res.status(401).json({ message: "Invalid email or password" });
+      return res.status(401).json({
+        success: false,
+        message: "Invalid email or password",
+      });
     }
 
     // Generate JWT token in cookie
     generateToken(res, user._id, user.email);
+
+    logger.info("User logged in", { userId: user._id, email: user.email });
 
     res.status(200).json({
       success: true,
@@ -98,25 +112,39 @@ export const login = async (req, res) => {
       },
     });
   } catch (error) {
-    console.error("❌ Login error:", error.message);
-    res.status(500).json({ message: "Internal server error" });
+    logger.error("Login error", { error: error.message });
+    captureException(error, { context: "login" });
+
+    res.status(500).json({
+      success: false,
+      message: "Internal server error",
+    });
   }
 };
 
 export const logout = (req, res) => {
   res.cookie("jwt", "", { httpOnly: true, expires: new Date(0) });
-  res.status(200).json({ message: "Logged out successfully" });
+
+  logger.info("User logged out", { userId: req.user?._id });
+
+  res.status(200).json({
+    success: true,
+    message: "Logged out successfully",
+  });
 };
 
 export const updateProfile = async (req, res) => {
   try {
+    // ✅ Validation already done by Zod middleware
     let { fullname, email, password, currentPassword } = req.body;
-
     const userId = req.user._id;
 
     const user = await User.findById(userId);
     if (!user) {
-      return res.status(404).json({ message: "User not found" });
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
     }
 
     // Handle avatar upload
@@ -132,8 +160,11 @@ export const updateProfile = async (req, res) => {
         user.avatar = result.secure_url;
         user.avatarPublicId = result.public_id;
       } catch (error) {
-        console.error("Avatar upload error:", error);
-        return res.status(500).json({ message: "Failed to upload avatar" });
+        logger.error("Avatar upload error", { error: error.message });
+        return res.status(500).json({
+          success: false,
+          message: "Failed to upload avatar",
+        });
       }
     }
 
@@ -144,7 +175,10 @@ export const updateProfile = async (req, res) => {
       if (email !== user.email) {
         const existingUser = await User.findOne({ email });
         if (existingUser) {
-          return res.status(400).json({ message: "Email already in use" });
+          return res.status(400).json({
+            success: false,
+            message: "Email already in use",
+          });
         }
         user.email = email;
       }
@@ -157,27 +191,25 @@ export const updateProfile = async (req, res) => {
 
     // Update password if provided
     if (password) {
-      if (!currentPassword) {
-        return res.status(400).json({
-          message: "Current password is required to set a new password",
-        });
-      }
-
-      const isCurrentPasswordValid = await bcrypt.compare(
-        currentPassword,
-        user.password
+      // ✅ currentPassword validation already done by Zod
+      const isCurrentPasswordValid = await user.comparePassword(
+        currentPassword
       );
 
       if (!isCurrentPasswordValid) {
-        return res
-          .status(401)
-          .json({ message: "Current password is incorrect" });
+        return res.status(401).json({
+          success: false,
+          message: "Current password is incorrect",
+        });
       }
 
-      user.password = await bcrypt.hash(password, 10);
+      // ✅ Will be hashed by pre-save hook
+      user.password = password;
     }
 
     await user.save();
+
+    logger.info("Profile updated", { userId: user._id });
 
     res.status(200).json({
       success: true,
@@ -190,7 +222,41 @@ export const updateProfile = async (req, res) => {
       },
     });
   } catch (error) {
-    console.error("❌ Update profile error:", error.message);
-    res.status(500).json({ message: "Internal server error" });
+    logger.error("Update profile error", { error: error.message });
+    captureException(error, { context: "updateProfile" });
+
+    res.status(500).json({
+      success: false,
+      message: "Internal server error",
+    });
+  }
+};
+
+export const checkAuth = async (req, res) => {
+  try {
+    const user = await User.findById(req.user._id).select("-password");
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      user: {
+        id: user._id,
+        fullname: user.fullname,
+        email: user.email,
+        avatar: user.avatar,
+      },
+    });
+  } catch (error) {
+    logger.error("Check auth error", { error: error.message });
+    res.status(500).json({
+      success: false,
+      message: "Internal server error",
+    });
   }
 };

@@ -11,7 +11,7 @@ export const generateToken = (res, userId, email) => {
     httpOnly: true,
     secure: ENV.NODE_ENV === "production", // send only over HTTPS in prod
     sameSite: "strict",
-    maxAge: 7 * 24 * 60 * 60 * 1000, // 30 days
+    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
   });
 
   return token;

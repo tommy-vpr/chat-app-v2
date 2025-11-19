@@ -1,34 +1,12 @@
-// backend/src/controllers/messageController.js (PRODUCTION-READY)
+// backend/controllers/messageController.js (CORRECTED)
 import { uploadToCloudinary } from "../utils/uploadToCloudinary.js";
 import Message from "../models/messageModel.js";
 import User from "../models/userModel.js";
 import sanitizeHtml from "sanitize-html";
-
-import { body, param, query, validationResult } from "express-validator";
 import { PAGINATION } from "../config/constant.js";
-
 import { getIO } from "../socket/socketHandler.js";
-
-// ==========================
-// VALIDATION MIDDLEWARE
-// ==========================
-export const validateSendMessage = [
-  body("receiverId").isMongoId().withMessage("Invalid receiver ID"),
-  body("text")
-    .optional()
-    .trim()
-    .isLength({ min: 1, max: 5000 })
-    .withMessage("Message must be 1-5000 characters"),
-];
-
-export const validateGetMessages = [
-  param("id").isMongoId().withMessage("Invalid user ID"),
-  query("before").optional().isISO8601().withMessage("Invalid date format"),
-  query("limit")
-    .optional()
-    .isInt({ min: 1, max: 100 })
-    .withMessage("Limit must be 1-100"),
-];
+import { logger } from "../lib/logger.js";
+import { captureException } from "../lib/sentry.js";
 
 // ==========================
 // SANITIZATION
@@ -62,7 +40,9 @@ export const getAllContacts = async (req, res) => {
       contacts,
     });
   } catch (error) {
-    console.error("❌ Get contacts error:", error);
+    logger.error("Get contacts error", { error: error.message });
+    captureException(error, { context: "getAllContacts" });
+
     res.status(500).json({
       success: false,
       message: "Failed to load contacts",
@@ -144,7 +124,9 @@ export const getChatPartners = async (req, res) => {
       chats: chatPartners,
     });
   } catch (error) {
-    console.error("❌ Get chat partners error:", error);
+    logger.error("Get chat partners error", { error: error.message });
+    captureException(error, { context: "getChatPartners" });
+
     res.status(500).json({
       success: false,
       message: "Failed to load chats",
@@ -157,14 +139,7 @@ export const getChatPartners = async (req, res) => {
 // ==========================
 export const getMessages = async (req, res) => {
   try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({
-        success: false,
-        errors: errors.array(),
-      });
-    }
-
+    // ✅ Validation already done by Zod middleware
     const { id: otherUserId } = req.params;
     const { before, limit = PAGINATION.MESSAGES_PER_PAGE } = req.query;
     const myId = req.user._id;
@@ -198,7 +173,7 @@ export const getMessages = async (req, res) => {
       .limit(limitNum)
       .lean();
 
-    // Mark as read
+    // Mark as read (non-blocking)
     Message.updateMany(
       {
         senderId: otherUserId,
@@ -216,7 +191,9 @@ export const getMessages = async (req, res) => {
       nextCursor: messages.length > 0 ? messages[0].createdAt : null,
     });
   } catch (error) {
-    console.error("❌ Get messages error:", error);
+    logger.error("Get messages error", { error: error.message });
+    captureException(error, { context: "getMessages" });
+
     res.status(500).json({
       success: false,
       message: "Failed to load messages",
@@ -229,23 +206,9 @@ export const getMessages = async (req, res) => {
 // ==========================
 export const sendMessage = async (req, res) => {
   try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({
-        success: false,
-        errors: errors.array(),
-      });
-    }
-
+    // ✅ Validation already done by Zod middleware
     const { receiverId, text } = req.body;
     const senderId = req.user._id;
-
-    if (!text && !req.file) {
-      return res.status(400).json({
-        success: false,
-        message: "Message content is required",
-      });
-    }
 
     const receiver = await User.findById(receiverId).lean();
     if (!receiver) {
@@ -264,7 +227,7 @@ export const sendMessage = async (req, res) => {
       read: false,
     });
 
-    // 🔥 NEW: broadcast via socket without creating again
+    // Broadcast via socket
     const io = getIO();
     if (io) {
       io.to(receiverId.toString()).emit("new_message", {
@@ -273,12 +236,20 @@ export const sendMessage = async (req, res) => {
       });
     }
 
+    logger.info("Message sent", {
+      messageId: message._id,
+      from: senderId,
+      to: receiverId,
+    });
+
     res.status(201).json({
       success: true,
       message,
     });
   } catch (error) {
-    console.error("❌ Send message error:", error);
+    logger.error("Send message error", { error: error.message });
+    captureException(error, { context: "sendMessage" });
+
     res.status(500).json({
       success: false,
       message: "Failed to send message",
@@ -291,15 +262,9 @@ export const sendMessage = async (req, res) => {
 // ==========================
 export const sendImageMessage = async (req, res) => {
   try {
-    const { receiverId } = req.body;
+    // ✅ Validation already done by Zod middleware
+    const { receiverId, text } = req.body;
     const senderId = req.user._id;
-
-    if (!receiverId) {
-      return res.status(400).json({
-        success: false,
-        message: "Receiver ID is required",
-      });
-    }
 
     if (!req.file) {
       return res.status(400).json({
@@ -325,19 +290,28 @@ export const sendImageMessage = async (req, res) => {
       });
     }
 
-    // ✅ Upload to Cloudinary first
+    const receiver = await User.findById(receiverId).lean();
+    if (!receiver) {
+      return res.status(404).json({
+        success: false,
+        message: "Receiver not found",
+      });
+    }
+
+    // Upload to Cloudinary
     const result = await uploadToCloudinary(req.file.buffer, "messages");
 
-    // ✅ CREATE the message
+    // Create the message
     const message = await Message.create({
       senderId,
       receiverId,
+      text: text ? sanitizeText(text) : "",
       image: result.secure_url,
       imagePublicId: result.public_id,
       read: false,
     });
 
-    // ✅ THEN emit to socket (AFTER message exists!)
+    // Emit to socket
     const io = getIO();
     if (io) {
       io.to(receiverId.toString()).emit("new_message", {
@@ -346,71 +320,23 @@ export const sendImageMessage = async (req, res) => {
       });
     }
 
+    logger.info("Image message sent", {
+      messageId: message._id,
+      from: senderId,
+      to: receiverId,
+    });
+
     res.status(201).json({
       success: true,
       message,
     });
   } catch (error) {
-    console.error("❌ Send image error:", error);
+    logger.error("Send image error", { error: error.message });
+    captureException(error, { context: "sendImageMessage" });
+
     res.status(500).json({
       success: false,
       message: "Failed to send image",
-    });
-  }
-};
-
-// ==========================
-// GET CONVERSATIONS LIST
-// ==========================
-export const getConversations = async (req, res) => {
-  try {
-    const userId = req.user._id;
-
-    const conversations = await Message.aggregate([
-      {
-        $match: {
-          $or: [{ senderId: userId }, { receiverId: userId }],
-        },
-      },
-      { $sort: { createdAt: -1 } },
-      {
-        $group: {
-          _id: {
-            $cond: [{ $eq: ["$senderId", userId] }, "$receiverId", "$senderId"],
-          },
-          lastMessage: { $first: "$$ROOT" },
-        },
-      },
-      {
-        $lookup: {
-          from: "users",
-          localField: "_id",
-          foreignField: "_id",
-          as: "userInfo",
-        },
-      },
-      { $unwind: "$userInfo" },
-      { $limit: 100 },
-      {
-        $project: {
-          _id: 1,
-          lastMessage: 1,
-          "userInfo.fullname": 1,
-          "userInfo.avatar": 1,
-          "userInfo.email": 1,
-        },
-      },
-    ]);
-
-    res.status(200).json({
-      success: true,
-      conversations,
-    });
-  } catch (error) {
-    console.error("❌ Get conversations error:", error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to load conversations",
     });
   }
 };

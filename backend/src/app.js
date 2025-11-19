@@ -1,20 +1,28 @@
-// backend/server.js (PRODUCTION-READY)
+// backend/server.js (PRODUCTION-READY v3 - FINAL)
 import express from "express";
 import { createServer } from "http";
 import cookieParser from "cookie-parser";
 import dotenv from "dotenv";
 import path from "path";
-import helmet from "helmet"; // ✅ Security headers
-import cors from "cors"; // ✅ CORS middleware
-import compression from "compression"; // ✅ Compress responses
-import morgan from "morgan"; // ✅ Request logging
-import rateLimit from "express-rate-limit"; // ✅ Rate limiting
+import helmet from "helmet";
+import cors from "cors";
+import compression from "compression";
+import rateLimit from "express-rate-limit";
+import slowDown from "express-slow-down";
 
 import authRoutes from "./routes/auth.js";
 import messageRoutes from "./routes/message.js";
 import { connectDB } from "./lib/db.js";
 import { ENV } from "./lib/env.js";
-import { initializeSocket } from "./socket/socketHandler.js";
+import { initializeSocket, getSocketMetrics } from "./socket/socketHandler.js";
+import { logger } from "./lib/logger.js";
+import {
+  initSentry,
+  sentryErrorHandler,
+  captureException,
+} from "./lib/sentry.js";
+import { requestLogger } from "./middleware/requestLogger.js";
+import { csrfProtection, getCsrfToken } from "./middleware/csrf.js";
 
 dotenv.config();
 
@@ -24,7 +32,14 @@ const httpServer = createServer(app);
 const __dirname = path.resolve();
 const PORT = ENV.PORT || 3000;
 
-// ===== SECURITY MIDDLEWARE =====
+// ==========================
+// SENTRY INITIALIZATION
+// ==========================
+initSentry(app);
+
+// ==========================
+// SECURITY MIDDLEWARE
+// ==========================
 
 // ✅ Helmet - Security headers
 app.use(
@@ -35,9 +50,15 @@ app.use(
         styleSrc: ["'self'", "'unsafe-inline'"],
         scriptSrc: ["'self'"],
         imgSrc: ["'self'", "data:", "https:", "blob:"],
+        connectSrc: ["'self'", "wss:", "ws:"],
       },
     },
     crossOriginEmbedderPolicy: false,
+    hsts: {
+      maxAge: 31536000,
+      includeSubDomains: true,
+      preload: true,
+    },
   })
 );
 
@@ -55,13 +76,6 @@ app.use(
 // ✅ Compression
 app.use(compression());
 
-// ✅ Request logging
-if (ENV.NODE_ENV === "development") {
-  app.use(morgan("dev"));
-} else {
-  app.use(morgan("combined"));
-}
-
 // ✅ Trust proxy (for rate limiting behind load balancer)
 app.set("trust proxy", 1);
 
@@ -70,56 +84,221 @@ app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 app.use(cookieParser());
 
+// ✅ Request logging (development only)
+if (ENV.NODE_ENV === "development") {
+  app.use(requestLogger);
+}
+
+// ==========================
+// RATE LIMITING
+// ==========================
+
+// ✅ Speed limiter (slow down requests before blocking)
+const speedLimiter = slowDown({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  delayAfter: 500, // Allow 500 requests per 15 mins, then start delaying
+  delayMs: (hits) => hits * 100, // Add 100ms delay per request
+  skip: (req) => ENV.NODE_ENV === "development",
+});
+
 // ✅ Global rate limiter
 const globalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 1000, // Limit each IP to 1000 requests per windowMs
-  message: "Too many requests from this IP, please try again later",
+  max: 1000,
+  message: {
+    success: false,
+    error: "Too many requests from this IP, please try again later",
+  },
   standardHeaders: true,
   legacyHeaders: false,
+  skip: (req) => ENV.NODE_ENV === "development",
 });
 
-app.use(globalLimiter);
-
-// ✅ API-specific rate limiter
+// ✅ API rate limiter
 const apiLimiter = rateLimit({
   windowMs: 60 * 1000, // 1 minute
-  max: 100, // 100 requests per minute
-  message: "Too many API requests, please slow down",
+  max: 100,
+  message: {
+    success: false,
+    error: "Too many API requests, please slow down",
+  },
+  skip: (req) => ENV.NODE_ENV === "development",
 });
 
-// ===== SOCKET.IO =====
+// ✅ Auth rate limiter (strict)
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5,
+  message: {
+    success: false,
+    error: "Too many authentication attempts. Try again in 15 minutes.",
+  },
+  skipSuccessfulRequests: true, // Don't count successful logins
+});
+
+app.use(speedLimiter);
+app.use(globalLimiter);
+
+// ==========================
+// SOCKET.IO
+// ==========================
 initializeSocket(httpServer);
-console.log("✅ Socket.io initialized");
+logger.info("Socket.io initialized");
 
-// ===== HEALTH CHECK =====
-app.get("/health", (req, res) => {
-  res.status(200).json({
-    status: "ok",
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-  });
+// ==========================
+// HEALTH CHECK
+// ==========================
+app.get("/health", async (req, res) => {
+  try {
+    // Check database
+    const dbConnection = await connectDB();
+    const dbStatus =
+      dbConnection.connection.readyState === 1 ? "connected" : "disconnected";
+
+    // Get socket metrics
+    const socketMetrics = getSocketMetrics();
+
+    const health = {
+      status: "ok",
+      timestamp: new Date().toISOString(),
+      uptime: process.uptime(),
+      environment: ENV.NODE_ENV,
+      database: dbStatus,
+      memory: {
+        used: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+        total: Math.round(process.memoryUsage().heapTotal / 1024 / 1024),
+        rss: Math.round(process.memoryUsage().rss / 1024 / 1024),
+      },
+      socket: socketMetrics,
+    };
+
+    res.status(200).json(health);
+  } catch (err) {
+    logger.error("Health check failed", { error: err.message });
+    res.status(503).json({
+      status: "error",
+      timestamp: new Date().toISOString(),
+      error: "Service unavailable",
+    });
+  }
 });
 
-// ===== API ROUTES =====
-app.use("/api/auth", apiLimiter, authRoutes);
+// ==========================
+// CSRF TOKEN ENDPOINT
+// ==========================
+app.get("/api/csrf-token", csrfProtection, getCsrfToken);
+
+// ==========================
+// API ROUTES
+// ==========================
+
+// Auth routes (with stricter rate limiting)
+app.use("/api/auth", authLimiter, authRoutes);
+
+// ✅ FIXED: Remove csrfProtection from here (it's already in the routes)
 app.use("/api/messages", apiLimiter, messageRoutes);
 
-// ===== SERVE FRONTEND IN PRODUCTION =====
+// ==========================
+// SERVE FRONTEND IN PRODUCTION
+// ==========================
 if (ENV.NODE_ENV === "production") {
   const frontendPath = path.join(__dirname, "../frontend/dist");
-  console.log("📦 Serving frontend from:", frontendPath);
+  logger.info("Serving frontend from", { path: frontendPath });
 
-  app.use(express.static(frontendPath));
+  app.use(
+    express.static(frontendPath, {
+      maxAge: "1d",
+      etag: true,
+      setHeaders: (res, filepath) => {
+        // Add security headers for static files
+        if (filepath.endsWith(".html")) {
+          res.setHeader("Cache-Control", "no-cache");
+        }
+      },
+    })
+  );
 
   app.get("*", (req, res) => {
     res.sendFile(path.join(frontendPath, "index.html"));
   });
 }
 
-// ===== ERROR HANDLER =====
+// ==========================
+// SENTRY ERROR HANDLER
+// ==========================
+app.use(sentryErrorHandler());
+
+// ==========================
+// ERROR HANDLER
+// ==========================
 app.use((err, req, res, next) => {
-  console.error("❌ Error:", err);
+  // CSRF error
+  if (err.code === "EBADCSRFTOKEN") {
+    logger.warn("CSRF token invalid", {
+      ip: req.ip,
+      path: req.path,
+      userAgent: req.get("user-agent"),
+    });
+    return res.status(403).json({
+      success: false,
+      error: "Invalid CSRF token",
+    });
+  }
+
+  // Multer file upload errors
+  if (err.name === "MulterError") {
+    logger.warn("File upload error", {
+      error: err.message,
+      code: err.code,
+      ip: req.ip,
+    });
+    return res.status(400).json({
+      success: false,
+      error: err.message,
+    });
+  }
+
+  // Validation errors (from Zod or Mongoose)
+  if (err.name === "ValidationError") {
+    logger.warn("Validation error", {
+      error: err.message,
+      ip: req.ip,
+    });
+    return res.status(400).json({
+      success: false,
+      error: "Validation failed",
+      details: err.errors,
+    });
+  }
+
+  // JWT errors
+  if (err.name === "JsonWebTokenError" || err.name === "TokenExpiredError") {
+    logger.warn("JWT error", {
+      error: err.message,
+      ip: req.ip,
+    });
+    return res.status(401).json({
+      success: false,
+      error: "Authentication failed",
+    });
+  }
+
+  // Log unknown errors
+  logger.error("Request error", {
+    error: err.message,
+    stack: err.stack,
+    path: req.path,
+    method: req.method,
+    ip: req.ip,
+  });
+
+  // Capture in Sentry
+  captureException(err, {
+    path: req.path,
+    method: req.method,
+    ip: req.ip,
+    user: req.user?._id,
+  });
 
   // Don't leak error details in production
   const message =
@@ -127,32 +306,43 @@ app.use((err, req, res, next) => {
 
   res.status(err.status || 500).json({
     success: false,
-    message,
+    error: message,
   });
 });
 
-// ===== 404 HANDLER =====
+// ==========================
+// 404 HANDLER
+// ==========================
 app.use((req, res) => {
+  logger.warn("Route not found", {
+    path: req.path,
+    method: req.method,
+    ip: req.ip,
+  });
+
   res.status(404).json({
     success: false,
-    message: "Route not found",
+    error: "Route not found",
   });
 });
 
-// ===== GRACEFUL SHUTDOWN =====
+// ==========================
+// GRACEFUL SHUTDOWN
+// ==========================
 const gracefulShutdown = async (signal) => {
-  console.log(`\n🛑 ${signal} received, shutting down gracefully...`);
+  logger.info(`${signal} received, shutting down gracefully...`);
 
   // Stop accepting new connections
   httpServer.close(async () => {
-    console.log("✅ HTTP server closed");
+    logger.info("HTTP server closed");
 
     // Close database connection
     try {
-      await connectDB().then((conn) => conn.connection.close());
-      console.log("✅ Database connection closed");
+      const connection = await connectDB();
+      await connection.connection.close();
+      logger.info("Database connection closed");
     } catch (err) {
-      console.error("❌ Error closing database:", err);
+      logger.error("Error closing database", { error: err.message });
     }
 
     process.exit(0);
@@ -160,7 +350,7 @@ const gracefulShutdown = async (signal) => {
 
   // Force close after 30 seconds
   setTimeout(() => {
-    console.error("❌ Forced shutdown after timeout");
+    logger.error("Forced shutdown after timeout");
     process.exit(1);
   }, 30000);
 };
@@ -168,23 +358,43 @@ const gracefulShutdown = async (signal) => {
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 
-// ===== START SERVER =====
+// ==========================
+// START SERVER
+// ==========================
 httpServer.listen(PORT, "0.0.0.0", () => {
-  console.log(`✅ Server running on port ${PORT}`);
-  console.log(`🔒 Security: Helmet enabled`);
-  console.log(`🚦 Rate limiting: Active`);
-  console.log(`🗜️ Compression: Enabled`);
-  console.log(`🚀 Socket.io: Ready`);
+  logger.info("Server started", {
+    port: PORT,
+    environment: ENV.NODE_ENV,
+    nodeVersion: process.version,
+    security: {
+      helmet: true,
+      cors: true,
+      csrf: true,
+      rateLimit: true,
+      compression: true,
+    },
+  });
+
   connectDB();
 });
 
-// ===== UNHANDLED ERRORS =====
+// ==========================
+// UNHANDLED ERRORS
+// ==========================
 process.on("unhandledRejection", (err) => {
-  console.error("❌ UNHANDLED REJECTION:", err);
+  logger.error("UNHANDLED REJECTION", {
+    error: err.message,
+    stack: err.stack,
+  });
+  captureException(err, { context: "unhandledRejection" });
   gracefulShutdown("UNHANDLED_REJECTION");
 });
 
 process.on("uncaughtException", (err) => {
-  console.error("❌ UNCAUGHT EXCEPTION:", err);
+  logger.error("UNCAUGHT EXCEPTION", {
+    error: err.message,
+    stack: err.stack,
+  });
+  captureException(err, { context: "uncaughtException" });
   gracefulShutdown("UNCAUGHT_EXCEPTION");
 });
